@@ -1,0 +1,12 @@
+{'ev': 'ready', 'w': 3840, 'h': 2160, 'vis': 'visible', 'webgpu': True}
+{'ev': 'selfcheck', 'full': 'err=0 px=117,118,138,255', 'sub': 'err=0 px=116,117,140,255', '2d': 'err=0 px=118,138,138,255', 'none': 'err=0 px=118,117,138,255', 'bitmap': '512x288 err=0 px=119,135,140,255', 'webgpu': 'ok', 'offscreen': 'ok 384x216'}
+phase                                         total vs base        App WebContent   GPU proc    Network  gpu%  page stats
+-------------------------------------------------------------------------------------------------------------------------
+video only                                     20.4    +4.4        1.2        0.9       18.3        0.1    50  {'fpsDone': 0, 'rvfcPerSec': 0, 'jsMsPerFrame': 0, 'dropped': 0, 'errs': 0} (n=16)
+15fps single canvas (WebGL)                    28.5   +12.5        5.6        4.9       17.9        0.0    51  {'fpsDone': 14.2, 'rvfcPerSec': 24.8, 'jsMsPerFrame': 1.504, 'dropped': 0, 'errs': 0} (n=17)
+15fps crossfade OffscreenCanvas+ImageBitmap    32.3   +16.3        5.5        7.8       19.0        0.0    52  {'fpsDone': 14.5, 'rvfcPerSec': 15.6, 'jsMsPerFrame': 2.638, 'dropped': 0, 'errs': 0} (n=17)
+15fps crossfade WebGL+2D copy                  32.2   +16.2        6.4        7.6       18.2        0.1    36  {'fpsDone': 14.8, 'rvfcPerSec': 15.3, 'jsMsPerFrame': 2.698, 'dropped': 0, 'errs': 0} (n=17)
+15fps crossfade WebGPU 2 canvases              26.8   +10.7        6.5        6.7       13.5        0.0    51  {'fpsDone': 14.3, 'rvfcPerSec': 20.2, 'jsMsPerFrame': 0.617, 'dropped': 0, 'errs': 0} (n=17)
+15fps single canvas (WebGPU)                   22.7    +6.6        5.3        4.5       12.7        0.1    53  {'fpsDone': 14.6, 'rvfcPerSec': 19.3, 'jsMsPerFrame': 0.332, 'dropped': 0, 'errs': 0} (n=17)
+30fps, rVFC every video frame                  33.7   +17.7        5.6        5.7       22.4        0.0    53  {'fpsDone': 29.4, 'rvfcPerSec': 57.2, 'jsMsPerFrame': 0.773, 'dropped': 0, 'errs': 0} (n=17)
+video only (repeat)                            11.6    -4.4        0.5        0.5       10.6        0.1    51  {'fpsDone': 0, 'rvfcPerSec': 0, 'jsMsPerFrame': 0, 'dropped': 0, 'errs': 0} (n=17)

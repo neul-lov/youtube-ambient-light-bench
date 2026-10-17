@@ -1,0 +1,5 @@
+media/*.mp4
+results/
+userscript-ab/scripts/
+__pycache__/
+.DS_Store

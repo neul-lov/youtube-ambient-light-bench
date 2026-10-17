@@ -1,0 +1,46 @@
+<!doctype html>
+<!--
+  Userscript A/B: loads the mock watch page in an iframe with no script, script A and script B,
+  alternating for `rounds` rounds, and POSTs each phase to /log.
+
+  ?a=/userscript-ab/scripts/a.js&b=/userscript-ab/scripts/b.js&rounds=2&sec=20&warm=5
+-->
+<html><head><meta charset="utf-8"><title>Userscript A/B</title>
+<style>body { margin: 0; background: #000; } iframe { border: 0; width: 100vw; height: 100vh; display: block; }</style></head>
+<body>
+<iframe id="f"></iframe>
+<script>
+"use strict";
+const QS = new URLSearchParams(location.search);
+const A = QS.get("a") || "/userscript-ab/scripts/a.js", B = QS.get("b") || "/userscript-ab/scripts/b.js";
+const ROUNDS = +(QS.get("rounds") || 2), SEC = +(QS.get("sec") || 20), WARM = +(QS.get("warm") || 5);
+const f = document.getElementById("f");
+const post = (o) => fetch("/log", { method: "POST", body: JSON.stringify(o) });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const load = (src) => new Promise((r) => { f.onload = r; f.src = "/watch" + (src ? "?s=" + encodeURIComponent(src) : ""); });
+
+async function label(url, fallback) {
+  try { const m = /@version\s+(\S+)/.exec(await (await fetch(url)).text()); return fallback + (m ? " " + m[1] : ""); } catch (e) { return fallback; }
+}
+
+(async () => {
+  const la = await label(A, "A"), lb = await label(B, "B");
+  const phases = [["video only", null]];
+  for (let r = 1; r <= ROUNDS; r++) phases.push([la + (r > 1 ? " #" + r : ""), A], [lb + (r > 1 ? " #" + r : ""), B]);
+  phases.push(["video only (repeat)", null]);
+  for (const [name, src] of phases) {
+    await load(src);
+    await sleep(WARM * 1000);
+    const w = f.contentWindow, vid = w.document.querySelector("video");
+    const c0 = { ...w.__cnt }, q0 = vid.getVideoPlaybackQuality();
+    await post({ ev: "start", name });
+    await sleep(SEC * 1000);
+    const c1 = w.__cnt, q1 = vid.getVideoPlaybackQuality();
+    await post({ ev: "end", name, uploadsPerSec: +((c1.up - c0.up) / SEC).toFixed(1), rvfcPerSec: +((c1.rvfc - c0.rvfc) / SEC).toFixed(1),
+      dropped: q1.droppedVideoFrames - q0.droppedVideoFrames, glow: !!w.document.querySelector("#ambl-root.ambl-ready"), vis: document.visibilityState });
+  }
+  f.src = "about:blank";
+  await post({ ev: "done" });
+})();
+</script>
+</body></html>
