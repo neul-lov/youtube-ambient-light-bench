@@ -1,0 +1,8 @@
+phase                                         total vs base        App WebContent   GPU proc    Network  gpu%  page stats
+-------------------------------------------------------------------------------------------------------------------------
+video only                                     16.3    +2.9        0.9        0.8       14.6        0.0    50  {'rvfcPerSec': 0, 'dropped': 0, 'uploadsPerSec': 0, 'glow': False} (n=17)
+A 2.8.0                                        30.9   +17.5        5.8        5.5       19.5        0.1    48  {'rvfcPerSec': 42.9, 'dropped': 0, 'uploadsPerSec': 28.8, 'glow': True} (n=17)
+B 2.9.0                                        23.9   +10.5        5.3        4.7       13.9        0.0    38  {'rvfcPerSec': 23.1, 'dropped': 0, 'uploadsPerSec': 14.9, 'glow': True} (n=16)
+A 2.8.0 #2                                     34.8   +21.4        6.3        6.4       22.1        0.1    42  {'rvfcPerSec': 56.2, 'dropped': 0, 'uploadsPerSec': 29.1, 'glow': True} (n=17)
+B 2.9.0 #2                                     29.0   +15.6        5.4        5.4       18.2        0.0    57  {'rvfcPerSec': 20.3, 'dropped': 0, 'uploadsPerSec': 14.7, 'glow': True} (n=17)
+video only (repeat)                            10.5    -2.9        0.5        0.5        9.5        0.0    38  {'rvfcPerSec': 0, 'dropped': 0, 'uploadsPerSec': 0, 'glow': False} (n=16)

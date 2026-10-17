@@ -1,0 +1,351 @@
+<!doctype html>
+<!--
+  Pipeline benchmark: a stand-in for the userscript's glow renderer (video → downscale → project →
+  2× blur → canvas scaled up behind the player), with the stage under test swapped per phase.
+  Each phase runs for `sec` seconds after `warm` seconds of warm-up and POSTs its start/end and
+  stats to /log, so tools/analyze.py can line the phases up with the CPU samples.
+
+  ?suite=upload|schedule|crossfade  (default upload)   &sec=20  &warm=3
+-->
+<html><head><meta charset="utf-8"><title>Glow pipeline benchmark</title>
+<style>
+  body { margin: 0; background: #000; color: #ccc; font: 13px ui-monospace, monospace; overflow: hidden; }
+  #v { position: absolute; left: 200px; top: 120px; width: 960px; height: 540px; z-index: 2; }
+  canvas.out { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; z-index: 1; }
+  #log { position: fixed; left: 8px; bottom: 8px; z-index: 3; }
+</style></head>
+<body>
+<video id="v" src="../media/test-4k60.mp4" muted autoplay playsinline></video>
+<div id="log">starting</div>
+<script>
+"use strict";
+const QS = new URLSearchParams(location.search);
+const SEC = +(QS.get("sec") || 20), WARM = +(QS.get("warm") || 3);
+const v = document.getElementById("v");
+const logEl = document.getElementById("log");
+const post = (o) => fetch("/log", { method: "POST", body: JSON.stringify(o) }).catch(() => {});
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const OW = 384, OH = 216; // output canvas, scaled up with a CSS transform like the userscript
+
+// Phase options:
+//   mode: "gl" (WebGL2) | "gpu" (WebGPU) | "rvfc" (wake-ups only) | none (video only)
+//   up:   how the frame gets into WebGL: "full" texImage2D(video), "sub" texSubImage2D(video),
+//         "bitmap" createImageBitmap(video, resize 512x288), "2d" 2D-canvas drawImage to 512x288,
+//         "none" upload once and reuse
+//   fps:  updates per second
+//   sleep: sleep until shortly before the next update instead of waking for every video frame
+//   hidden: keep the output canvas invisible (isolates the compositing cost)
+//   xfade: "bitmap" OffscreenCanvas → ImageBitmap → 2 canvases, "copy2d" WebGL + 2D copy of the
+//          previous frame, "dual" WebGPU rendering into 2 canvases; the new frame fades in on top
+const SUITES = {
+  upload: [
+    { name: "video only" },
+    { name: "rVFC wake-ups only (no drawing)", mode: "rvfc" },
+    { name: "WebGL texImage2D 30fps", mode: "gl", up: "full", fps: 30, sleep: true },
+    { name: "WebGL texImage2D 15fps", mode: "gl", up: "full", fps: 15, sleep: true },
+    { name: "WebGL texImage2D 10fps", mode: "gl", up: "full", fps: 10, sleep: true },
+    { name: "WebGL createImageBitmap 512 30fps", mode: "gl", up: "bitmap", fps: 30, sleep: true },
+    { name: "WebGL 2D-canvas 512 30fps", mode: "gl", up: "2d", fps: 30, sleep: true },
+    { name: "WebGL texSubImage2D 30fps", mode: "gl", up: "sub", fps: 30, sleep: true },
+    { name: "WebGPU external texture 30fps", mode: "gpu", fps: 30, sleep: true },
+    { name: "video only (repeat)" },
+  ],
+  schedule: [
+    { name: "video only" },
+    { name: "30fps, rVFC every video frame", mode: "gl", up: "full", fps: 30 },
+    { name: "30fps, sleep then rVFC", mode: "gl", up: "full", fps: 30, sleep: true },
+    { name: "15fps, sleep then rVFC", mode: "gl", up: "full", fps: 15, sleep: true },
+    { name: "10fps, sleep then rVFC", mode: "gl", up: "full", fps: 10, sleep: true },
+    { name: "30fps, no upload (reuse texture)", mode: "gl", up: "none", fps: 30, sleep: true },
+    { name: "30fps, output hidden", mode: "gl", up: "full", fps: 30, sleep: true, hidden: true },
+    { name: "video only (repeat)" },
+  ],
+  crossfade: [
+    { name: "video only" },
+    { name: "15fps single canvas (WebGL)", mode: "gl", up: "full", fps: 15, sleep: true },
+    { name: "15fps crossfade OffscreenCanvas+ImageBitmap", mode: "gl", up: "full", fps: 15, sleep: true, xfade: "bitmap" },
+    { name: "15fps crossfade WebGL+2D copy", mode: "gl", up: "full", fps: 15, sleep: true, xfade: "copy2d" },
+    { name: "15fps crossfade WebGPU 2 canvases", mode: "gpu", fps: 15, sleep: true, xfade: "dual" },
+    { name: "15fps single canvas (WebGPU)", mode: "gpu", fps: 15, sleep: true },
+    { name: "30fps, rVFC every video frame", mode: "gl", up: "full", fps: 30 },
+    { name: "video only (repeat)" },
+  ],
+};
+
+function makeOut() {
+  const c = document.createElement("canvas");
+  c.className = "out";
+  c.width = OW; c.height = OH;
+  c.style.width = OW + "px"; c.style.height = OH + "px";
+  c.style.transform = `translate(-200px, -180px) scale(${(1760 / OW).toFixed(4)}, ${(1140 / OH).toFixed(4)})`;
+  document.body.appendChild(c);
+  return c;
+}
+
+// ───────── WebGL2: 4K → 512 → 128 box downscale, "projection", 2 blur passes ─────────
+function setupGL(canvas, up, preserve) {
+  const gl = canvas.getContext("webgl2", { alpha: true, premultipliedAlpha: true, antialias: false, depth: false, stencil: false, preserveDrawingBuffer: !!preserve, powerPreference: "low-power" });
+  if (!gl) throw new Error("no webgl2");
+  const VS = `#version 300 es
+in vec2 p; out vec2 uv; void main(){ uv = p * .5 + .5; gl_Position = vec4(p, 0., 1.); }`;
+  const BOX = `#version 300 es
+precision highp float; in vec2 uv; uniform sampler2D t; uniform vec2 tap; uniform float flip; out vec4 o;
+void main(){ vec2 c = vec2(uv.x, mix(uv.y, 1.0 - uv.y, flip)); vec3 s = vec3(0.);
+  for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) s += texture(t, c + (vec2(float(i), float(j)) - 1.5) * tap).rgb;
+  o = vec4(s / 16., 1.); }`;
+  const BLUR = `#version 300 es
+precision highp float; in vec2 uv; uniform sampler2D t; uniform vec2 dir; out vec4 o;
+void main(){ vec4 s = vec4(0.); float ws = 0.;
+  for (int i = -12; i <= 12; i++) { float x = float(i); float w = exp(-0.5 * x * x / 9.); s += texture(t, uv + dir * x) * w; ws += w; }
+  o = s / ws; }`;
+  const prog = (fs) => {
+    const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+    const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(p, 0, "p"); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    return { p, u: (n) => gl.getUniformLocation(p, n) };
+  };
+  const box = prog(BOX), blur = prog(BLUR);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  const tex = () => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    for (const [k, val] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, val);
+    return t; };
+  const target = (w, h) => { const t = tex(); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null); return { t, fb, w, h }; };
+  const vtex = tex();
+  const mid = target(512, 288), src = target(128, 72), proj = target(OW, OH), tmp = target(OW, OH);
+  const run = (P, dst, t, uni) => {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dst ? dst.fb : null);
+    gl.viewport(0, 0, dst ? dst.w : OW, dst ? dst.h : OH);
+    gl.useProgram(P.p); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, t); gl.uniform1i(P.u("t"), 0);
+    for (const k in uni) { const val = uni[k]; if (typeof val === "number") gl.uniform1f(P.u(k), val); else gl.uniform2fv(P.u(k), val); }
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  };
+  let c2d = null, ctx2d = null;
+  if (up === "2d") { c2d = document.createElement("canvas"); c2d.width = 512; c2d.height = 288; ctx2d = c2d.getContext("2d"); }
+  let uploadedOnce = false;
+  const passes = (small) => {
+    if (small) run(box, src, vtex, { tap: [1 / 128 / 4, 1 / 72 / 4], flip: 1 });
+    else { run(box, mid, vtex, { tap: [1 / 512 / 4, 1 / 288 / 4], flip: 1 }); run(box, src, mid.t, { tap: [1 / 128 / 4, 1 / 72 / 4], flip: 0 }); }
+    run(box, proj, src.t, { tap: [1 / OW / 4, 1 / OH / 4], flip: 0 });
+    run(blur, tmp, proj.t, { dir: [1.5 / OW, 0] });
+    run(blur, null, tmp.t, { dir: [0, 1.5 / OH] });
+  };
+  return {
+    gl,
+    frame() {
+      gl.bindTexture(gl.TEXTURE_2D, vtex);
+      if (up === "full") gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, v);
+      else if (up === "sub") { if (!uploadedOnce) { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, v.videoWidth, v.videoHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null); uploadedOnce = true; } gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, v); }
+      else if (up === "none") { if (!uploadedOnce) { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, v); uploadedOnce = true; } }
+      else if (up === "2d") { ctx2d.drawImage(v, 0, 0, 512, 288); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c2d); }
+      passes(up === "2d");
+    },
+    frameFromBitmap(bmp) {
+      gl.bindTexture(gl.TEXTURE_2D, vtex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+      passes(true);
+    },
+    destroy() { const e = gl.getExtension("WEBGL_lose_context"); if (e) e.loseContext(); },
+  };
+}
+
+// ───────── WebGPU: the same passes, sampling the video through importExternalTexture ─────────
+async function setupGPU(canvas, canvas2) {
+  if (!navigator.gpu) throw new Error("no navigator.gpu");
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "low-power" });
+  const device = await adapter.requestDevice();
+  const fmt = navigator.gpu.getPreferredCanvasFormat();
+  const ctxs = [canvas, canvas2].filter(Boolean).map((c) => { const x = c.getContext("webgpu"); x.configure({ device, format: fmt, alphaMode: "premultiplied" }); return x; });
+  let which = 0;
+  const VS = `
+struct VOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VOut {
+  var p = array<vec2f, 4>(vec2f(-1., -1.), vec2f(1., -1.), vec2f(-1., 1.), vec2f(1., 1.));
+  var o: VOut; o.pos = vec4f(p[i], 0., 1.); o.uv = vec2f(p[i].x * .5 + .5, .5 - p[i].y * .5); return o;
+}`;
+  const code = VS + `
+@group(0) @binding(0) var s: sampler;
+@group(0) @binding(1) var ext: texture_external;
+@group(0) @binding(2) var<uniform> tap: vec4f;
+@fragment fn fsExt(in: VOut) -> @location(0) vec4f {
+  var sum = vec3f(0.);
+  for (var i = 0; i < 4; i++) { for (var j = 0; j < 4; j++) {
+    sum += textureSampleBaseClampToEdge(ext, s, in.uv + (vec2f(f32(i), f32(j)) - 1.5) * tap.xy).rgb; } }
+  return vec4f(sum / 16., 1.);
+}`;
+  const code2 = VS + `
+@group(0) @binding(0) var s: sampler;
+@group(0) @binding(1) var t: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> tap: vec4f;
+@fragment fn fsBox(in: VOut) -> @location(0) vec4f {
+  var sum = vec3f(0.);
+  for (var i = 0; i < 4; i++) { for (var j = 0; j < 4; j++) {
+    sum += textureSample(t, s, in.uv + (vec2f(f32(i), f32(j)) - 1.5) * tap.xy).rgb; } }
+  return vec4f(sum / 16., 1.);
+}
+@fragment fn fsBlur(in: VOut) -> @location(0) vec4f {
+  var sum = vec4f(0.); var ws = 0.;
+  for (var i = -12; i <= 12; i++) { let x = f32(i); let w = exp(-0.5 * x * x / 9.);
+    sum += textureSample(t, s, in.uv + tap.xy * x) * w; ws += w; }
+  return sum / ws;
+}`;
+  const m1 = device.createShaderModule({ code }), m2 = device.createShaderModule({ code: code2 });
+  const pipe = (mod, entry, format) => device.createRenderPipeline({ layout: "auto",
+    vertex: { module: mod, entryPoint: "vs" }, fragment: { module: mod, entryPoint: entry, targets: [{ format }] },
+    primitive: { topology: "triangle-strip" } });
+  const pExt = pipe(m1, "fsExt", "rgba8unorm"), pBox = pipe(m2, "fsBox", "rgba8unorm"), pBlur = pipe(m2, "fsBlur", "rgba8unorm"), pBlurOut = pipe(m2, "fsBlur", fmt);
+  const samp = device.createSampler({ magFilter: "linear", minFilter: "linear" });
+  const target = (w, h) => device.createTexture({ size: [w, h], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+  const mid = target(512, 288), src = target(128, 72), proj = target(OW, OH), tmp = target(OW, OH);
+  const ub = (a) => { const b = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, new Float32Array(a)); return b; };
+  const u0 = ub([1 / 512 / 4, 1 / 288 / 4, 0, 0]), u1 = ub([1 / 128 / 4, 1 / 72 / 4, 0, 0]), u2 = ub([1 / OW / 4, 1 / OH / 4, 0, 0]), u3 = ub([1.5 / OW, 0, 0, 0]), u4 = ub([0, 1.5 / OH, 0, 0]);
+  const bg = (p, texView, u) => device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [{ binding: 0, resource: samp }, { binding: 1, resource: texView }, { binding: 2, resource: { buffer: u } }] });
+  const bg1 = bg(pBox, mid.createView(), u1), bg2 = bg(pBox, src.createView(), u2), bg3 = bg(pBlur, proj.createView(), u3), bg4 = bg(pBlurOut, tmp.createView(), u4);
+  const pass = (enc, view, p, g) => { const rp = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 0] }] }); rp.setPipeline(p); rp.setBindGroup(0, g); rp.draw(4); rp.end(); };
+  return {
+    frame(target) {
+      if (target !== undefined) which = target;
+      const ext = device.importExternalTexture({ source: v }); // must be re-imported every frame
+      const bg0 = device.createBindGroup({ layout: pExt.getBindGroupLayout(0), entries: [{ binding: 0, resource: samp }, { binding: 1, resource: ext }, { binding: 2, resource: { buffer: u0 } }] });
+      const enc = device.createCommandEncoder();
+      pass(enc, mid.createView(), pExt, bg0);
+      pass(enc, src.createView(), pBox, bg1);
+      pass(enc, proj.createView(), pBox, bg2);
+      pass(enc, tmp.createView(), pBlur, bg3);
+      pass(enc, ctxs[which].getCurrentTexture().createView(), pBlurOut, bg4);
+      device.queue.submit([enc.finish()]);
+    },
+    destroy() { device.destroy(); },
+  };
+}
+
+// ───────── Crossfade: the new frame goes into the canvas underneath, which then fades in on top ─────────
+function fadeIn(el, other, dur) {
+  for (const an of el.getAnimations()) an.cancel();
+  el.style.zIndex = 1; if (other) other.style.zIndex = 0;
+  el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: dur, easing: "linear", fill: "forwards" });
+}
+
+async function setupPhase(ph) {
+  const dur = (1000 / ph.fps) * 0.9;
+  if (ph.xfade === "bitmap") {
+    const off = new OffscreenCanvas(OW, OH), cv = [makeOut(), makeOut()], ctx = cv.map((c) => c.getContext("bitmaprenderer"));
+    const R = setupGL(off, ph.up);
+    let top = 1;
+    return { cv, R, frame() { R.frame(); const n = 1 - top; ctx[n].transferFromImageBitmap(off.transferToImageBitmap()); fadeIn(cv[n], cv[top], dur); top = n; } };
+  }
+  if (ph.xfade === "copy2d") {
+    const glc = makeOut(), prev = makeOut(), pctx = prev.getContext("2d");
+    prev.style.zIndex = 0; glc.style.zIndex = 1;
+    const R = setupGL(glc, ph.up, true); // the previous frame must survive to be copied
+    return { cv: [glc, prev], R, frame() { pctx.drawImage(glc, 0, 0); for (const an of glc.getAnimations()) an.cancel(); R.frame(); glc.animate([{ opacity: 0 }, { opacity: 1 }], { duration: dur, easing: "linear", fill: "forwards" }); } };
+  }
+  if (ph.xfade === "dual") {
+    const cv = [makeOut(), makeOut()];
+    const R = await setupGPU(cv[0], cv[1]);
+    let top = 1;
+    return { cv, R, frame() { const n = 1 - top; R.frame(n); fadeIn(cv[n], cv[top], dur); top = n; } };
+  }
+  if (ph.mode === "gl" || ph.mode === "gpu") {
+    const c = makeOut();
+    if (ph.hidden) c.style.visibility = "hidden";
+    const R = ph.mode === "gl" ? setupGL(c, ph.up) : await setupGPU(c);
+    return { cv: [c], R, frame() { R.frame(); } };
+  }
+  return { cv: [], R: null, frame() {} };
+}
+
+async function runPhase(ph) {
+  const P = await setupPhase(ph);
+  let frames = 0, calls = 0, js = 0, last = 0, errs = 0, lastErr = "", inflight = false, stop = false;
+  // Returns true when a frame was drawn synchronously; createImageBitmap counts its frame when it resolves
+  const work = () => {
+    if (ph.up === "bitmap") {
+      if (inflight) return false;
+      inflight = true;
+      const a = performance.now();
+      createImageBitmap(v, { resizeWidth: 512, resizeHeight: 288, resizeQuality: "low" }).then((bmp) => {
+        const b = performance.now();
+        if (!stop) { P.R.frameFromBitmap(bmp); frames++; }
+        bmp.close(); inflight = false; js += performance.now() - b;
+      }, (e) => { errs++; lastErr = String(e); inflight = false; });
+      js += performance.now() - a;
+      return false;
+    }
+    P.frame();
+    return true;
+  };
+  const step = (now) => {
+    if (stop) return;
+    calls++;
+    if (P.R && now - last >= 1000 / ph.fps - 2) {
+      last = now;
+      const a = performance.now();
+      try { if (work()) frames++; } catch (e) { errs++; lastErr = String(e); }
+      if (ph.up !== "bitmap") js += performance.now() - a;
+    }
+    if (ph.sleep && P.R) {
+      // Sleep until shortly before the next update is due, then wait for one video frame
+      const wait = 1000 / ph.fps - (performance.now() - last) - 20;
+      if (wait > 0) { setTimeout(() => !stop && v.requestVideoFrameCallback(step), wait); return; }
+    }
+    v.requestVideoFrameCallback(step);
+  };
+  if (ph.mode) v.requestVideoFrameCallback(step);
+  logEl.textContent = ph.name + " (warm-up)";
+  await sleep(WARM * 1000);
+  frames = 0; calls = 0; js = 0; errs = 0;
+  const q0 = v.getVideoPlaybackQuality();
+  await post({ ev: "start", name: ph.name });
+  logEl.textContent = ph.name;
+  await sleep(SEC * 1000);
+  const q1 = v.getVideoPlaybackQuality();
+  await post({ ev: "end", name: ph.name, fpsDone: +(frames / SEC).toFixed(1), rvfcPerSec: +(calls / SEC).toFixed(1),
+    jsMsPerFrame: frames ? +(js / frames).toFixed(3) : 0, dropped: q1.droppedVideoFrames - q0.droppedVideoFrames,
+    decoded: q1.totalVideoFrames - q0.totalVideoFrames, vis: document.visibilityState, errs, lastErr });
+  stop = true;
+  await sleep(300);
+  if (P.R) P.R.destroy();
+  P.cv.forEach((c) => c.remove());
+  await sleep(1500);
+}
+
+// Safari can stall at a clip's loop point, so loop manually before the end, with a stall watchdog
+let lastCt = -1, sameCt = 0;
+setInterval(() => {
+  if (v.duration && v.currentTime > v.duration - 3) v.currentTime = 0.5;
+  sameCt = v.currentTime === lastCt ? sameCt + 1 : 0; lastCt = v.currentTime;
+  if (sameCt >= 4) { v.currentTime = 0.5; v.play(); post({ ev: "unstall", ct: lastCt }); sameCt = 0; }
+}, 250);
+
+async function selfCheck() {
+  // Run each path once and read back a pixel, so a broken path shows up before the timed phases
+  const out = {};
+  const px = (R) => { const p = new Uint8Array(4); R.gl.readPixels(OW / 2, OH / 2, 1, 1, R.gl.RGBA, R.gl.UNSIGNED_BYTE, p); return "err=" + R.gl.getError() + " px=" + [...p]; };
+  for (const up of ["full", "sub", "2d", "none"]) { const c = makeOut(); try { const R = setupGL(c, up); R.frame(); R.frame(); out[up] = px(R); R.destroy(); } catch (e) { out[up] = "EXC " + e; } c.remove(); }
+  { const c = makeOut(); try { const R = setupGL(c, "bitmap"); const b = await createImageBitmap(v, { resizeWidth: 512, resizeHeight: 288, resizeQuality: "low" }); const size = b.width + "x" + b.height; R.frameFromBitmap(b); out.bitmap = size + " " + px(R); b.close(); R.destroy(); } catch (e) { out.bitmap = "EXC " + e; } c.remove(); }
+  { const c = makeOut(); try { const R = await setupGPU(c); R.frame(); await sleep(200); out.webgpu = "ok"; R.destroy(); } catch (e) { out.webgpu = "EXC " + e; } c.remove(); }
+  try { const off = new OffscreenCanvas(OW, OH); const R = setupGL(off, "full"); R.frame(); const bmp = off.transferToImageBitmap(); const size = bmp.width + "x" + bmp.height; const c = makeOut(); c.getContext("bitmaprenderer").transferFromImageBitmap(bmp); out.offscreen = "ok " + size; c.remove(); R.destroy(); } catch (e) { out.offscreen = "EXC " + e; }
+  await post({ ev: "selfcheck", ...out });
+}
+
+(async () => {
+  const suite = SUITES[QS.get("suite") || "upload"];
+  if (!suite) { logEl.textContent = "unknown suite"; await post({ ev: "done", error: "unknown suite" }); return; }
+  try { await v.play(); } catch (e) { post({ ev: "playError", e: String(e) }); }
+  await new Promise((r) => (v.readyState >= 3 ? r() : v.addEventListener("canplay", r, { once: true })));
+  await post({ ev: "ready", w: v.videoWidth, h: v.videoHeight, vis: document.visibilityState, webgpu: !!navigator.gpu, ua: navigator.userAgent });
+  await selfCheck();
+  for (const ph of suite) {
+    try { await runPhase(ph); } catch (e) { await post({ ev: "phaseError", name: ph.name, e: String(e) }); }
+  }
+  await post({ ev: "done" });
+  logEl.textContent = "done";
+  v.pause();
+})();
+</script>
+</body></html>

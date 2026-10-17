@@ -1,0 +1,14 @@
+{'ev': 'ready', 'w': 3840, 'h': 2160, 'vis': 'visible', 'webgpu': True}
+{'ev': 'selfcheck', 'full': 'err=0 px=117,118,138,255', 'sub': 'err=0 px=116,117,140,255', '2d': 'err=0 px=116,117,138,255', 'none': 'err=0 px=117,118,138,255', 'bitmap': '512x288 err=0 px=116,117,140,255', 'webgpu': 'ok', 'offscreen': 'ok 384x216'}
+phase                                         total vs base        App WebContent   GPU proc    Network  gpu%  page stats
+-------------------------------------------------------------------------------------------------------------------------
+video only                                     14.9    +1.8        1.1        0.9       12.9        0.1    29  {'fpsDone': 0, 'rvfcPerSec': 0, 'jsMsPerFrame': 0, 'dropped': 2, 'errs': 0} (n=16)
+rVFC wake-ups only (no drawing)                18.6    +5.4        2.4        3.5       12.8        0.0    34  {'fpsDone': 0, 'rvfcPerSec': 41, 'jsMsPerFrame': 0, 'dropped': 0, 'errs': 0} (n=16)
+WebGL texImage2D 30fps                         31.0   +17.8        5.6        5.7       19.7        0.0    32  {'fpsDone': 29.1, 'rvfcPerSec': 29.9, 'jsMsPerFrame': 0.792, 'dropped': 0, 'errs': 0} (n=16)
+WebGL texImage2D 15fps                         23.4   +10.3        5.0        4.4       14.0        0.1    33  {'fpsDone': 14.4, 'rvfcPerSec': 15.6, 'jsMsPerFrame': 0.774, 'dropped': 0, 'errs': 0} (n=17)
+WebGL texImage2D 10fps                         19.8    +6.6        3.7        3.3       12.8        0.1    41  {'fpsDone': 9.9, 'rvfcPerSec': 10.3, 'jsMsPerFrame': 0.909, 'dropped': 0, 'errs': 0} (n=17)
+WebGL createImageBitmap 512 30fps              55.9   +42.7        1.5        2.8       51.6        0.0    52  {'fpsDone': 19.7, 'rvfcPerSec': 19.8, 'jsMsPerFrame': 35.152, 'dropped': 0, 'errs': 0} (n=17)
+WebGL 2D-canvas 512 30fps                      58.5   +45.3        2.0        3.5       52.9        0.0    50  {'fpsDone': 28.6, 'rvfcPerSec': 30.2, 'jsMsPerFrame': 20.609, 'dropped': 0, 'errs': 0} (n=17)
+WebGL texSubImage2D 30fps                      70.6   +57.4        1.4       53.4       15.8        0.0    50  {'fpsDone': 22.6, 'rvfcPerSec': 27, 'jsMsPerFrame': 27.084, 'dropped': 0, 'errs': 0} (n=17)
+WebGPU external texture 30fps                  24.5   +11.3        5.5        4.8       14.2        0.0    53  {'fpsDone': 27.2, 'rvfcPerSec': 29.9, 'jsMsPerFrame': 0.324, 'dropped': 0, 'errs': 0} (n=16)
+video only (repeat)                            11.4    -1.8        0.5        0.5       10.3        0.0    52  {'fpsDone': 0, 'rvfcPerSec': 0, 'jsMsPerFrame': 0, 'dropped': 0, 'errs': 0} (n=17)
